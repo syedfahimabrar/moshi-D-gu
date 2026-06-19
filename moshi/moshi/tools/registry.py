@@ -7,12 +7,15 @@ The function signature defines its call interface; args are passed as kwargs.
 import asyncio
 import datetime
 import logging
-from typing import Callable, Optional
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
 _TOOLS: dict[str, Callable] = {}
 _TIMEOUT = 5.0  # seconds per tool call
+
+# Cities to fetch when no specific city is requested
+_CONTEXT_CITIES = ["Stockholm", "London", "New York", "Tokyo", "Sydney", "Dubai"]
 
 
 def tool(fn: Callable) -> Callable:
@@ -35,7 +38,6 @@ async def call(name: str, args: dict) -> str:
 
 
 def get_tool_spec_prompt() -> str:
-    """One-line description of available tools, for injection into the system prompt."""
     names = list(_TOOLS.keys())
     return (
         "You have access to real-time tools: " + ", ".join(names) + ". "
@@ -49,26 +51,30 @@ def get_tool_spec_prompt() -> str:
 @tool
 async def get_time() -> str:
     now = datetime.datetime.now()
-    # e.g. "3:45 PM on Thursday, June 19, 2026"
     return now.strftime("%-I:%M %p on %A, %B %-d, %Y")
 
 
-@tool
-async def get_weather(city: str = "Dhaka") -> str:
-    """Fetch current weather using wttr.in (no API key required)."""
+async def _fetch_one(session, city: str) -> str:
+    """Fetch weather for a single city; returns 'City: condition, temp' or error."""
+    import aiohttp
+    url = f"https://wttr.in/{city.replace(' ', '+')}?format=%C,+%t"
     try:
-        import aiohttp
-        # %C=condition, %t=temp(°C), %f=feels-like — plain text, no emoji
-        url = f"https://wttr.in/{city}?format=%C,+%t,+feels+like+%f"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=_TIMEOUT)
-            ) as resp:
-                if resp.status == 200:
-                    raw = (await resp.text()).strip()
-                    label = city if city != "local" else "your area"
-                    return f"Weather in {label}: {raw}"
-        return f"Weather unavailable for {city}"
-    except Exception as exc:
-        logger.error(f"[tool] get_weather({city!r}): {exc}")
-        return f"Weather unavailable for {city}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=_TIMEOUT)) as resp:
+            if resp.status == 200:
+                raw = (await resp.text()).strip()
+                return f"{city}: {raw}"
+    except Exception:
+        pass
+    return f"{city}: unavailable"
+
+
+@tool
+async def get_weather(city: str = "") -> str:
+    """Fetch current weather. If no city given, returns context for all major cities."""
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        if city:
+            return await _fetch_one(session, city)
+        # No specific city — fetch all context cities in parallel
+        results = await asyncio.gather(*[_fetch_one(session, c) for c in _CONTEXT_CITIES])
+    return " | ".join(results)

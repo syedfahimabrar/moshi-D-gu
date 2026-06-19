@@ -52,7 +52,7 @@ _TRIGGERS: list[tuple[re.Pattern, str, Callable]] = [
         # Only trigger on explicit weather query, not bare "weather"
         re.compile(r"\b(what('s| is) the weather|how('s| is) the weather|weather (today|now|outside|like))\b", re.IGNORECASE),
         "get_weather",
-        lambda _: {"city": "Dhaka"},
+        lambda _: {"city": ""},  # empty → fetch all context cities
     ),
     (
         # Only trigger on explicit time query, not bare "time"
