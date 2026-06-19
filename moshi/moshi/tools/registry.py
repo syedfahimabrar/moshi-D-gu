@@ -54,7 +54,7 @@ async def get_time() -> str:
 
 
 @tool
-async def get_weather(city: str = "local") -> str:
+async def get_weather(city: str = "Dhaka") -> str:
     """Fetch current weather using wttr.in (no API key required)."""
     try:
         import aiohttp

@@ -30,7 +30,7 @@ from . import registry as reg
 logger = logging.getLogger(__name__)
 
 _BUFFER_MAX      = 160  # rolling text buffer chars (keyword fallback)
-_COOLDOWN_FRAMES = 25   # ~2 s at 12.5 Hz before same trigger can fire again
+_COOLDOWN_FRAMES = 75   # ~6 s at 12.5 Hz before same trigger can fire again
 
 
 class ToolOrchestrator:
