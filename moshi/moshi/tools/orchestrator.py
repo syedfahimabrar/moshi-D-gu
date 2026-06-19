@@ -2,23 +2,16 @@
 ToolOrchestrator — wraps LMGen.step() to intercept the inner-monologue text
 stream, dispatch local tool calls, and inject results as forced text tokens.
 
-Architecture note
------------------
-LMGen.step() already accepts an optional ``text_token`` int argument that
-teacher-forces the text channel for the current frame *before* the depth
-transformer runs (so audio is conditioned on the forced text — i.e. the model
-speaks it). _step_text_prompt_core() uses exactly this mechanism to inject the
-system persona prompt.  The orchestrator reuses it at conversation time to
-inject real tool results.
+Two detection paths (both active):
 
-State machine (per session, reset when reset_streaming() is called):
+  Phase-B (fine-tuned model): watch for special token IDs 32000–32003.
+    NORMAL → 32000 (<|tool_call|>) → IN_CALL (buffer tokens)
+    IN_CALL → 32001 (<|tool_end|>)  → EXEC (dispatch tool)
+    EXEC → result ready → INJECT (force 32002 + result + 32003)
+    INJECT → queue drained → NORMAL + cooldown
 
-  NORMAL → (keyword in text buffer) → EXEC → (tool result ready) → INJECT → NORMAL
-                                        ↑                                        │
-                                        └──────────────── cooldown ──────────────┘
-
-The model speaks freely during EXEC; during INJECT we force one result token
-per frame.  A cooldown prevents re-triggering on the echoed result text.
+  Phase-A fallback (keyword, training-free): watch rolling text buffer for
+    keywords ("time", "weather") in NORMAL state. Injects raw result text.
 """
 import asyncio
 import logging
@@ -28,32 +21,26 @@ from typing import Optional
 import torch
 import sentencepiece
 
-from .protocol import OrchestratorState, ToolIntent, detect_intent
+from .protocol import (
+    OrchestratorState, ToolIntent, detect_intent,
+    TOOL_CALL_ID, TOOL_END_ID, TOOL_RESULT_ID, TOOL_RESULT_END_ID,
+)
 from . import registry as reg
 
 logger = logging.getLogger(__name__)
 
-# Rolling text buffer size (chars) for trigger detection
-_BUFFER_MAX = 160
-# Frames before the same trigger can fire again (~2 seconds at 12.5 Hz)
-_COOLDOWN_FRAMES = 25
+_BUFFER_MAX      = 160  # rolling text buffer chars (keyword fallback)
+_COOLDOWN_FRAMES = 25   # ~2 s at 12.5 Hz before same trigger can fire again
 
 
 class ToolOrchestrator:
     """
     Drop-in wrapper around LMGen for the per-frame inference loop.
 
-    Usage (server / async context)::
+    Usage::
 
         orchestrator = ToolOrchestrator(lm_gen, text_tokenizer)
-        # replace:  tokens = lm_gen.step(codes[:, :, c:c+1])
-        # with:     tokens = orchestrator.step(codes[:, :, c:c+1])
-
-    Usage (offline / sync context — must be inside asyncio.run())::
-
-        # Same as above; ensure the outer coroutine is run with asyncio.run()
-        # and sprinkle `await asyncio.sleep(0)` in the frame loop so pending
-        # tool tasks get a chance to execute.
+        tokens = orchestrator.step(codes[:, :, c:c+1])
     """
 
     def __init__(
@@ -61,30 +48,28 @@ class ToolOrchestrator:
         lm_gen,
         text_tokenizer: sentencepiece.SentencePieceProcessor,
     ) -> None:
-        self.lm_gen = lm_gen
+        self.lm_gen    = lm_gen
         self.tokenizer = text_tokenizer
         self._reset_session_state()
 
     def _reset_session_state(self) -> None:
-        self.state = OrchestratorState.NORMAL
-        self._text_buffer = ""
+        self.state             = OrchestratorState.NORMAL
+        self._text_buffer      = ""        # keyword fallback
+        self._call_buf: list[int] = []     # token IDs between <|tool_call|> … <|tool_end|>
         self._inject_queue: deque[int] = deque()
-        self._cooldown = 0
+        self._cooldown         = 0
         self._pending_task: Optional[asyncio.Task] = None
 
-    # ── Public API ───────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def step(
         self,
         input_tokens: torch.Tensor,
         moshi_tokens: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Call once per 80 ms frame; mirrors LMGen.step() signature."""
-        # Advance cooldown counter
         if self._cooldown > 0:
             self._cooldown -= 1
 
-        # Pop next injection token (None → model samples freely this frame)
         forced = self._next_inject_token()
 
         tokens = self.lm_gen.step(
@@ -94,30 +79,50 @@ class ToolOrchestrator:
         )
 
         if tokens is not None:
-            text_token_id = int(tokens[0, 0, 0].item())
-            self._observe(text_token_id)
+            self._observe(int(tokens[0, 0, 0].item()))
 
         return tokens
 
-    # ── Internal helpers ─────────────────────────────────────────────────────
+    # ── Internal ──────────────────────────────────────────────────────────────
 
     def _next_inject_token(self) -> Optional[int]:
         if self.state is not OrchestratorState.INJECT:
             return None
         if not self._inject_queue:
-            # Queue drained → return to NORMAL and start cooldown
-            self.state = OrchestratorState.NORMAL
+            self.state     = OrchestratorState.NORMAL
             self._cooldown = _COOLDOWN_FRAMES
             return None
-        token = self._inject_queue.popleft()
-        return token
+        return self._inject_queue.popleft()
 
     def _observe(self, token_id: int) -> None:
-        """Update rolling text buffer and fire tool calls when a trigger matches."""
-        # Skip PAD (3) and EPAD (0) and out-of-range ids
-        if token_id in (0, 3) or token_id >= self.tokenizer.get_piece_size():
+        # ── Phase-B: structured special-token protocol ────────────────────────
+        if token_id == TOOL_CALL_ID and self.state is OrchestratorState.NORMAL and self._cooldown == 0:
+            logger.info("[orchestrator] <|tool_call|> detected — buffering call")
+            self._call_buf = []
+            self.state     = OrchestratorState.IN_CALL
             return
 
+        if self.state is OrchestratorState.IN_CALL:
+            if token_id == TOOL_END_ID:
+                # Decode buffered tokens → "get_time" or "get_weather {\"city\":\"X\"}"
+                raw = self.tokenizer.decode(self._call_buf).strip()
+                logger.info(f"[orchestrator] call buffer decoded: {raw!r}")
+                intent = _parse_call(raw)
+                if intent:
+                    self._call_buf = []
+                    self.state     = OrchestratorState.EXEC
+                    self._pending_task = asyncio.ensure_future(self._run_tool(intent))
+                else:
+                    logger.warning(f"[orchestrator] unrecognised call: {raw!r}")
+                    self.state     = OrchestratorState.NORMAL
+                    self._cooldown = _COOLDOWN_FRAMES
+            else:
+                self._call_buf.append(token_id)
+            return
+
+        # ── Phase-A fallback: keyword detection in rolling text buffer ─────────
+        if token_id in (0, 3) or token_id >= self.tokenizer.get_piece_size():
+            return
         piece = self.tokenizer.id_to_piece(token_id).replace("▁", " ")
         self._text_buffer += piece
         if len(self._text_buffer) > _BUFFER_MAX:
@@ -130,21 +135,42 @@ class ToolOrchestrator:
         ):
             intent = detect_intent(self._text_buffer)
             if intent:
-                logger.info(f"[orchestrator] detected intent: {intent}")
+                logger.info(f"[orchestrator] keyword intent: {intent}")
                 self._text_buffer = ""
-                self.state = OrchestratorState.EXEC
-                self._pending_task = asyncio.ensure_future(self._run_tool(intent))
+                self.state        = OrchestratorState.EXEC
+                self._pending_task = asyncio.ensure_future(self._run_tool(intent, structured=False))
 
-    async def _run_tool(self, intent: ToolIntent) -> None:
+    async def _run_tool(self, intent: ToolIntent, structured: bool = True) -> None:
         try:
             result = await reg.call(intent.name, intent.args)
-            logger.info(f"[orchestrator] tool result: {result!r}")
+            logger.info(f"[orchestrator] result: {result!r}")
             result_tokens = self.tokenizer.encode(result)
-            self._inject_queue.extend(result_tokens)
+            if structured:
+                # Wrap with <|tool_result|> … <|tool_result_end|> so the model
+                # sees the same format it was fine-tuned on.
+                self._inject_queue.extend([TOOL_RESULT_ID] + result_tokens + [TOOL_RESULT_END_ID])
+            else:
+                self._inject_queue.extend(result_tokens)
             self.state = OrchestratorState.INJECT
         except Exception as exc:
             logger.error(f"[orchestrator] tool task failed: {exc}")
-            self.state = OrchestratorState.NORMAL
+            self.state     = OrchestratorState.NORMAL
             self._cooldown = _COOLDOWN_FRAMES
         finally:
             self._pending_task = None
+
+
+def _parse_call(raw: str) -> Optional[ToolIntent]:
+    """Parse 'get_time' or 'get_weather {"city": "Dhaka"}' into a ToolIntent."""
+    import json
+    parts = raw.split(None, 1)
+    if not parts:
+        return None
+    name = parts[0]
+    args: dict = {}
+    if len(parts) > 1:
+        try:
+            args = json.loads(parts[1])
+        except json.JSONDecodeError:
+            pass
+    return ToolIntent(name=name, args=args)

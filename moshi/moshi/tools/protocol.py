@@ -13,10 +13,18 @@ from enum import Enum, auto
 from typing import Callable, Optional
 
 
+# Special token IDs added by the fine-tuning patch
+TOOL_CALL_ID       = 32000  # <|tool_call|>
+TOOL_END_ID        = 32001  # <|tool_end|>
+TOOL_RESULT_ID     = 32002  # <|tool_result|>
+TOOL_RESULT_END_ID = 32003  # <|tool_result_end|>
+
+
 class OrchestratorState(Enum):
-    NORMAL = auto()   # monitoring; no active tool call
-    EXEC   = auto()   # tool dispatched; model speaks freely while we wait
-    INJECT = auto()   # result ready; forcing text tokens one per frame
+    NORMAL  = auto()  # monitoring; no active tool call
+    IN_CALL = auto()  # buffering tokens between <|tool_call|> and <|tool_end|>
+    EXEC    = auto()  # tool dispatched; model speaks freely while we wait
+    INJECT  = auto()  # result ready; forcing text tokens one per frame
 
 
 @dataclass

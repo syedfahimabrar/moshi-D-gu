@@ -16,5 +16,9 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [ gpu ]
+    command: >
+      /app/moshi/.venv/bin/python -m moshi.server
+      --ssl /app/ssl
+      --moshi-hf-repo abrarfahim/moshi-tool-finetuned
     volumes:
       - ./.cache:/root/.cache

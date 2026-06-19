@@ -375,6 +375,11 @@ def main():
     parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO,
                         help="HF repo to look into, defaults PersonaPlex. "
                              "Use this to select a different pre-trained model.")
+    parser.add_argument("--moshi-hf-repo", type=str, default=None,
+                        help="HF repo for the Moshi LM weights and tokenizer only. "
+                             "Voices and Mimi are still loaded from --hf-repo. "
+                             "Use this to load a fine-tuned model while keeping "
+                             "the original voices (e.g. abrarfahim/moshi-tool-finetuned).")
     parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
@@ -441,13 +446,14 @@ def main():
     other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
     logger.info("mimi loaded")
 
+    moshi_repo = args.moshi_hf_repo or args.hf_repo
     if args.tokenizer is None:
-        args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME)
+        args.tokenizer = hf_hub_download(moshi_repo, loaders.TEXT_TOKENIZER_NAME)
     text_tokenizer = sentencepiece.SentencePieceProcessor(args.tokenizer)  # type: ignore
 
     logger.info("loading moshi")
     if args.moshi_weight is None:
-        args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
+        args.moshi_weight = hf_hub_download(moshi_repo, loaders.MOSHI_NAME)
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
     logger.info("moshi loaded")
