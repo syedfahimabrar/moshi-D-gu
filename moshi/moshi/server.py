@@ -447,13 +447,15 @@ def main():
     logger.info("mimi loaded")
 
     moshi_repo = args.moshi_hf_repo or args.hf_repo
+    logger.info(f"loading tokenizer from {moshi_repo}")
     if args.tokenizer is None:
         args.tokenizer = hf_hub_download(moshi_repo, loaders.TEXT_TOKENIZER_NAME)
     text_tokenizer = sentencepiece.SentencePieceProcessor(args.tokenizer)  # type: ignore
 
-    logger.info("loading moshi")
+    logger.info(f"loading moshi from {moshi_repo}")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(moshi_repo, loaders.MOSHI_NAME)
+    logger.info(f"moshi weight path: {args.moshi_weight}")
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
     logger.info("moshi loaded")
