@@ -57,14 +57,17 @@ async def get_time() -> str:
 async def get_weather(city: str = "local") -> str:
     """Fetch current weather using wttr.in (no API key required)."""
     try:
-        import aiohttp  # already a dep via server.py
-        url = f"https://wttr.in/{city}?format=3"
+        import aiohttp
+        # %C=condition, %t=temp(°C), %f=feels-like — plain text, no emoji
+        url = f"https://wttr.in/{city}?format=%C,+%t,+feels+like+%f"
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=_TIMEOUT)
             ) as resp:
                 if resp.status == 200:
-                    return (await resp.text()).strip()
+                    raw = (await resp.text()).strip()
+                    label = city if city != "local" else "your area"
+                    return f"Weather in {label}: {raw}"
         return f"Weather unavailable for {city}"
     except Exception as exc:
         logger.error(f"[tool] get_weather({city!r}): {exc}")
