@@ -126,6 +126,14 @@ def _is_safetensors(path: Path | str) -> bool:
     return Path(path).suffix in (".safetensors", ".sft", ".sfts")
 
 
+def _peek_text_card(filename: str) -> int:
+    """Read text_card from safetensors metadata without loading the full file."""
+    from safetensors import safe_open
+    with safe_open(filename, framework="pt") as f:
+        shape = f.get_slice("text_linear.weight").get_shape()
+    return shape[0]  # text_linear.weight is [text_card, dim]
+
+
 def get_mimi(filename: str | Path,
              device: torch.device | str = 'cpu') -> MimiModel:
     """Return a pretrained Mimi model."""
@@ -187,6 +195,13 @@ def get_moshi_lm(
     lm_kwargs["dep_q"] = 16
     if delays is not None:
         lm_kwargs["delays"] = delays
+
+    # Auto-detect text_card from checkpoint (handles patched vocab sizes)
+    if filename is not None and _is_safetensors(filename):
+        detected = _peek_text_card(str(filename))
+        if detected != lm_kwargs["text_card"]:
+            logger.info(f"Detected text_card={detected} from checkpoint (default was {lm_kwargs['text_card']})")
+            lm_kwargs["text_card"] = detected
 
     if cpu_offload and filename is not None:
         return _get_moshi_lm_with_offload(
