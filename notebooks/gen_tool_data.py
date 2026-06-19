@@ -1,25 +1,31 @@
 """
-Tool-calling training-data generator (shared by notebooks 01 and 02).
+Tool-calling training-data generator (audio-grounded).
 
-Call `generate(tok)` to get a list of {"tokens", "mask", "type"} rows, or
-`save(path, tok)` to write the JSONL directly. Keeping this in one module means
-notebook 02 can regenerate fresh data right after cloning — no stale committed
-file, no GitHub round-trip.
+Produces abstract, turn-structured examples that are independent of the
+tokenizer and of audio. Each example is a list of Turn objects:
 
-Design:
-- Call / result / time formats match the runtime tools exactly:
-    call    "get_weather London"            (orchestrator._parse_call)
-    result  "London: Clear, +27°C"          (registry._fetch_one, wttr.in %C,%t)
-    time    "8:31 PM on Friday, June 19, 2026"  (registry.get_time)
-- Principled masking: trainable=True (mask=1) ONLY on tokens the model must
-  EMIT — the tool call and the spoken reply. The injected <|tool_result|> block
-  is context (mask=0) because at runtime it is force-fed, not predicted.
-- Heavy negatives (silence / chit-chat / distractors) so the model does NOT
-  fire on silence or on sentences that merely contain "time"/"weather".
+    Turn.query   : str   -> the user's SPOKEN input (TTS'd into the user audio
+                           stream).  None means a pure-silence turn.
+    Turn.tool    : ("get_time", None) | ("get_weather", "London") | None
+    Turn.result  : str   -> the tool result text injected into Moshi's text
+                           stream (mask=0, it is force-fed at runtime).
+    Turn.reply   : str   -> what Moshi SPEAKS after (its text monologue, mask=1).
+
+Notebook 01 turns each example into a [17, T] code tensor:
+    row 0     = text monologue   (PAD while listening, then call + reply)
+    rows 1:9  = Moshi audio      (silence)
+    rows 9:17 = user audio       (Mimi-encoded TTS of Turn.query)
+
+This is the key difference from the old text-only data: the question now lives
+in the *audio* rows, so the model learns to emit <|tool_call|> when it HEARS a
+request, not when it reads one.
+
+render_emit(turn, tok) returns the (tokens, mask) the model must produce in the
+text stream after hearing that turn's audio.
 """
-import json
 import random
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
 
 PAD_ID             = 3
 TOOL_CALL_ID       = 32000
@@ -104,152 +110,139 @@ _DISTRACTORS = [
 ]
 
 
-def _make(tok):
-    """Return a dict of generator functions bound to a tokenizer."""
-    def encode(text):
-        return [i for i in tok.encode(text) if i < 32000]
+@dataclass
+class Turn:
+    query: Optional[str]                 # spoken user input (None = silence)
+    reply: str = ""                      # Moshi's spoken reply
+    tool: Optional[tuple] = None         # (name, arg) e.g. ("get_weather","London")
+    result: Optional[str] = None         # injected tool result text
 
-    def build(segments, ex_type):
-        tokens, mask = [], []
-        for toks, train in segments:
-            tokens.extend(toks)
-            mask.extend([1 if train else 0] * len(toks))
-        return {"tokens": tokens, "mask": mask, "type": ex_type}
 
-    def gap(lo=4, hi=18):
-        return [PAD_ID] * random.randint(lo, hi)
+@dataclass
+class Example:
+    type: str
+    turns: list = field(default_factory=list)
 
-    # ── time ──────────────────────────────────────────────────────────────────
-    def real_time():
-        h, m = random.randint(1, 12), random.randint(0, 59)
-        ap = random.choice(["AM", "PM"])
-        day, mon, d = random.choice(_DAYS), random.choice(_MONTHS), random.randint(1, 28)
-        result = f"{h}:{m:02d} {ap} on {day}, {mon} {d}, 2026"
-        spoken = (f"{h} {ap.lower()}" if m == 0 else f"{h}:{m:02d} {ap.lower()}")
-        return result, spoken
 
-    def time_turn(trigger):
-        result, spoken = real_time()
-        return [
-            (encode(trigger), False), (gap(), False),
-            ([TOOL_CALL_ID], True), (encode("get_time"), True), ([TOOL_END_ID], True),
-            ([TOOL_RESULT_ID], False), (encode(result), False), ([TOOL_RESULT_END_ID], False),
-            (encode(random.choice(_TIME_RESPONSES).format(s=spoken)), True),
-        ]
+# ── builders ──────────────────────────────────────────────────────────────────
+def _time():
+    h, m = random.randint(1, 12), random.randint(0, 59)
+    ap = random.choice(["AM", "PM"])
+    day, mon, d = random.choice(_DAYS), random.choice(_MONTHS), random.randint(1, 28)
+    result = f"{h}:{m:02d} {ap} on {day}, {mon} {d}, 2026"
+    spoken = (f"{h} {ap.lower()}" if m == 0 else f"{h}:{m:02d} {ap.lower()}")
+    return result, spoken
 
-    def time_example():
-        return build(time_turn(random.choice(_TIME_TRIGGERS)), "time")
 
-    def time_multiturn():
-        segs = time_turn(random.choice(_TIME_TRIGGERS))
-        segs.append((gap(8, 25), False))
-        segs.extend(time_turn(random.choice(_TIME_FOLLOWUPS)))
-        return build(segs, "time_multiturn")
+def _weather(city):
+    cond = random.choice(_CONDITIONS)
+    t = random.randint(-8, 40)
+    temp = f"+{t}°C" if t >= 0 else f"{t}°C"
+    return f"{city}: {cond}, {temp}", cond, temp
 
-    # ── weather ────────────────────────────────────────────────────────────────
-    def real_weather(city):
-        cond = random.choice(_CONDITIONS)
-        t = random.randint(-8, 40)
-        temp = f"+{t}°C" if t >= 0 else f"{t}°C"
-        return f"{city}: {cond}, {temp}", cond, temp
 
-    def weather_turn(trigger, city):
-        result, cond, temp = real_weather(city)
-        resp = random.choice(_WEATHER_RESPONSES).format(
-            city=city, cond=cond, cond_l=cond.lower(), temp=temp)
-        return [
-            (encode(trigger), False), (gap(), False),
-            ([TOOL_CALL_ID], True), (encode(f"get_weather {city}"), True), ([TOOL_END_ID], True),
-            ([TOOL_RESULT_ID], False), (encode(result), False), ([TOOL_RESULT_END_ID], False),
-            (encode(resp), True),
-        ]
+def _time_turn(query):
+    result, spoken = _time()
+    return Turn(query=query, tool=("get_time", None), result=result,
+                reply=random.choice(_TIME_RESPONSES).format(s=spoken))
 
-    def weather_example(city=None):
-        city = city or random.choice(_CITIES)
-        triggers = [f"what's the weather in {city}", f"weather in {city}",
-                    f"how's the weather in {city}", f"what's it like in {city}",
-                    f"is it raining in {city}", f"how hot is it in {city}",
-                    f"tell me the weather in {city}", f"check the weather in {city}"]
-        return build(weather_turn(random.choice(triggers), city), "weather")
 
-    def weather_local():
-        cond = random.choice(_CONDITIONS)
-        t = random.randint(-8, 40)
-        temp = f"+{t}°C" if t >= 0 else f"{t}°C"
-        result = f"Local: {cond}, {temp}"
-        trigger = random.choice([
-            "what's the weather like", "how's the weather", "what's it like outside",
-            "is it cold out", "do I need a jacket", "what's the weather today",
-            "how's it looking outside", "is it raining",
+def _weather_turn(query, city):
+    result, cond, temp = _weather(city)
+    reply = random.choice(_WEATHER_RESPONSES).format(
+        city=city, cond=cond, cond_l=cond.lower(), temp=temp)
+    return Turn(query=query, tool=("get_weather", city), result=result, reply=reply)
+
+
+def _make(kind, city=None):
+    if kind == "time":
+        return Example("time", [_time_turn(random.choice(_TIME_TRIGGERS))])
+    if kind == "time_multiturn":
+        return Example("time_multiturn", [
+            _time_turn(random.choice(_TIME_TRIGGERS)),
+            _time_turn(random.choice(_TIME_FOLLOWUPS)),
         ])
-        resp = random.choice(_WEATHER_LOCAL_RESP).format(cond_l=cond.lower(), temp=temp)
-        segs = [
-            (encode(trigger), False), (gap(), False),
-            ([TOOL_CALL_ID], True), (encode("get_weather"), True), ([TOOL_END_ID], True),
-            ([TOOL_RESULT_ID], False), (encode(result), False), ([TOOL_RESULT_END_ID], False),
-            (encode(resp), True),
-        ]
-        return build(segs, "weather_local")
-
-    def weather_multiturn():
+    if kind == "weather":
+        city = city or random.choice(_CITIES)
+        q = random.choice([f"what's the weather in {city}", f"weather in {city}",
+                           f"how's the weather in {city}", f"what's it like in {city}",
+                           f"is it raining in {city}", f"how hot is it in {city}",
+                           f"tell me the weather in {city}", f"check the weather in {city}"])
+        return Example("weather", [_weather_turn(q, city)])
+    if kind == "weather_local":
+        cond = random.choice(_CONDITIONS)
+        t = random.randint(-8, 40)
+        temp = f"+{t}°C" if t >= 0 else f"{t}°C"
+        q = random.choice(["what's the weather like", "how's the weather",
+                           "what's it like outside", "is it cold out", "do I need a jacket",
+                           "what's the weather today", "how's it looking outside", "is it raining"])
+        reply = random.choice(_WEATHER_LOCAL_RESP).format(cond_l=cond.lower(), temp=temp)
+        return Example("weather_local",
+                       [Turn(query=q, tool=("get_weather", None),
+                             result=f"Local: {cond}, {temp}", reply=reply)])
+    if kind == "weather_multiturn":
         c1, c2 = random.sample(_CITIES, 2)
-        segs = weather_turn(f"what's the weather in {c1}", c1)
-        segs.append((gap(8, 25), False))
-        segs.extend(weather_turn(random.choice([f"and {c2}", f"what about {c2}",
-                                                f"how about {c2}", f"and in {c2}"]), c2))
-        return build(segs, "weather_multiturn")
-
-    # ── negatives ────────────────────────────────────────────────────────────────
-    def silence_example():
-        n = random.randint(20, 60)
-        k = random.randint(n // 3, n // 2)
-        return {"tokens": [PAD_ID] * n, "mask": [0] * k + [1] * (n - k), "type": "silence"}
-
-    def chitchat_example():
+        q2 = random.choice([f"and {c2}", f"what about {c2}", f"how about {c2}", f"and in {c2}"])
+        return Example("weather_multiturn", [
+            _weather_turn(f"what's the weather in {c1}", c1),
+            _weather_turn(q2, c2),
+        ])
+    if kind == "chitchat":
         q, a = random.choice(_CHITCHAT)
-        return build([(encode(q), False), (gap(), False), (encode(a), True)], "chitchat")
-
-    def distractor_example():
+        return Example("chitchat", [Turn(query=q, reply=a)])
+    if kind == "distractor":
         q, a = random.choice(_DISTRACTORS)
-        return build([(encode(q), False), (gap(), False), (encode(a), True)], "distractor")
+        return Example("distractor", [Turn(query=q, reply=a)])
+    if kind == "silence":
+        return Example("silence", [Turn(query=None, reply="")])
+    raise ValueError(kind)
 
-    return locals()
 
-
-def generate(tok, seed=42):
-    """Build and return the full dataset (list of rows)."""
+def examples(seed=42):
+    """Return the full list of abstract Examples."""
     random.seed(seed)
-    g = _make(tok)
-    data = []
-    for _ in range(500):
-        data.append(g["time_example"]())
-    for _ in range(150):
-        data.append(g["time_multiturn"]())
+    out = []
+    for _ in range(400):
+        out.append(_make("time"))
+    for _ in range(120):
+        out.append(_make("time_multiturn"))
     for city in _CITIES:
-        for _ in range(12):
-            data.append(g["weather_example"](city))
-    for _ in range(150):
-        data.append(g["weather_example"]())
-    for _ in range(150):
-        data.append(g["weather_local"]())
-    for _ in range(150):
-        data.append(g["weather_multiturn"]())
-    for _ in range(200):
-        data.append(g["silence_example"]())
-    for _ in range(250):
-        data.append(g["chitchat_example"]())
-    for _ in range(300):
-        data.append(g["distractor_example"]())
-    random.shuffle(data)
-    return data
+        for _ in range(8):
+            out.append(_make("weather", city))
+    for _ in range(120):
+        out.append(_make("weather"))
+    for _ in range(120):
+        out.append(_make("weather_local"))
+    for _ in range(120):
+        out.append(_make("weather_multiturn"))
+    for _ in range(180):
+        out.append(_make("silence"))
+    for _ in range(220):
+        out.append(_make("chitchat"))
+    for _ in range(260):
+        out.append(_make("distractor"))
+    random.shuffle(out)
+    return out
 
 
-def save(path, tok, seed=42):
-    """Generate and write the dataset to a JSONL file; returns the dataset."""
-    data = generate(tok, seed=seed)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        for ex in data:
-            f.write(json.dumps(ex) + "\n")
-    return data
+def render_emit(turn, tok):
+    """Tokens + mask the model must EMIT in its text stream for this turn.
+
+    mask=1 → trained (tool call + spoken reply); mask=0 → injected context
+    (the <|tool_result|> block, which is force-fed at runtime).
+    """
+    def enc(s):
+        return [i for i in tok.encode(s) if i < 32000]
+
+    toks, mask = [], []
+    if turn.tool is not None:
+        name, arg = turn.tool
+        call = name if arg is None else f"{name} {arg}"
+        toks.append(TOOL_CALL_ID);                 mask.append(1)
+        for t in enc(call):     toks.append(t);    mask.append(1)
+        toks.append(TOOL_END_ID);                  mask.append(1)
+        toks.append(TOOL_RESULT_ID);               mask.append(0)
+        for t in enc(turn.result or ""): toks.append(t); mask.append(0)
+        toks.append(TOOL_RESULT_END_ID);           mask.append(0)
+    for t in enc(turn.reply):   toks.append(t);    mask.append(1)
+    return toks, mask
