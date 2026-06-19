@@ -146,15 +146,24 @@ class ToolOrchestrator:
 
 
 def _parse_call(raw: str) -> Optional[ToolIntent]:
-    """Parse 'get_time' or 'get_weather {"city": "Dhaka"}' into a ToolIntent."""
+    """Parse a tool call the model emitted into a ToolIntent.
+
+    Accepts two formats:
+      - "get_time"                      → name only, no args
+      - "get_weather London"           → plain trailing arg → {"city": "London"}
+      - 'get_weather {"city": "X"}'    → JSON args
+    """
     parts = raw.split(None, 1)
     if not parts:
         return None
     name = parts[0]
     args: dict = {}
     if len(parts) > 1:
+        rest = parts[1].strip()
         try:
-            args = json.loads(parts[1])
+            args = json.loads(rest)
         except json.JSONDecodeError:
-            pass
+            # Plain trailing argument (what the model emits naturally).
+            if name == "get_weather" and rest:
+                args = {"city": rest}
     return ToolIntent(name=name, args=args)
