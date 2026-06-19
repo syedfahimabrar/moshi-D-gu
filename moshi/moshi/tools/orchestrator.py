@@ -1,19 +1,24 @@
 """
-ToolOrchestrator — wraps LMGen.step() to intercept the inner-monologue text
-stream, dispatch local tool calls, and inject results as forced text tokens.
+ToolOrchestrator — wraps LMGen.step() to intercept Moshi's inner-monologue
+text stream, dispatch local tool calls, and inject results as forced text
+tokens so the model speaks the answer.
 
-Two detection paths (both active):
+The tool call is driven entirely by the model itself. Moshi was fine-tuned to
+emit the reserved special tokens; the orchestrator only reacts to them — there
+is no keyword matching or any other heuristic on the model's natural speech.
 
-  Phase-B (fine-tuned model): watch for special token IDs 32000–32003.
-    NORMAL → 32000 (<|tool_call|>) → IN_CALL (buffer tokens)
-    IN_CALL → 32001 (<|tool_end|>)  → EXEC (dispatch tool)
-    EXEC → result ready → INJECT (force 32002 + result + 32003)
-    INJECT → queue drained → NORMAL + cooldown
+State machine (per session, reset on reset_streaming()):
 
-  Phase-A fallback (keyword, training-free): watch rolling text buffer for
-    keywords ("time", "weather") in NORMAL state. Injects raw result text.
+    NORMAL  → 32000 <|tool_call|>        → IN_CALL   (buffer call tokens)
+    IN_CALL → 32001 <|tool_end|>         → EXEC      (dispatch tool async)
+    EXEC    → tool result ready          → INJECT    (force 32002 + result + 32003)
+    INJECT  → inject queue drained       → NORMAL    (+ cooldown)
+
+The model speaks freely during EXEC; during INJECT we force one result token
+per frame so the audio is conditioned on the real tool output.
 """
 import asyncio
+import json
 import logging
 from collections import deque
 from typing import Optional
@@ -22,15 +27,14 @@ import torch
 import sentencepiece
 
 from .protocol import (
-    OrchestratorState, ToolIntent, detect_intent,
+    OrchestratorState, ToolIntent,
     TOOL_CALL_ID, TOOL_END_ID, TOOL_RESULT_ID, TOOL_RESULT_END_ID,
 )
 from . import registry as reg
 
 logger = logging.getLogger(__name__)
 
-_BUFFER_MAX      = 160  # rolling text buffer chars (keyword fallback)
-_COOLDOWN_FRAMES = 75   # ~6 s at 12.5 Hz before same trigger can fire again
+_COOLDOWN_FRAMES = 25  # ~2 s at 12.5 Hz before another call can fire
 
 
 class ToolOrchestrator:
@@ -47,21 +51,14 @@ class ToolOrchestrator:
         self,
         lm_gen,
         text_tokenizer: sentencepiece.SentencePieceProcessor,
-        enable_keyword_fallback: bool = False,
     ) -> None:
         self.lm_gen    = lm_gen
         self.tokenizer = text_tokenizer
-        # Phase-A keyword fallback triggers on the model's OWN speech, which
-        # causes false positives (e.g. "in many places" → city="many") and
-        # unprompted tool talk. Off by default now the model is fine-tuned to
-        # emit the <|tool_call|> special tokens directly.
-        self.enable_keyword_fallback = enable_keyword_fallback
         self._reset_session_state()
 
     def _reset_session_state(self) -> None:
         self.state             = OrchestratorState.NORMAL
-        self._text_buffer      = ""        # keyword fallback
-        self._call_buf: list[int] = []     # token IDs between <|tool_call|> … <|tool_end|>
+        self._call_buf: list[int] = []     # tokens between <|tool_call|> … <|tool_end|>
         self._inject_queue: deque[int] = deque()
         self._cooldown         = 0
         self._pending_task: Optional[asyncio.Task] = None
@@ -95,25 +92,28 @@ class ToolOrchestrator:
         if self.state is not OrchestratorState.INJECT:
             return None
         if not self._inject_queue:
-            self.state        = OrchestratorState.NORMAL
-            self._cooldown    = _COOLDOWN_FRAMES
-            self._text_buffer = ""  # clear so injected result doesn't re-trigger
+            self.state     = OrchestratorState.NORMAL
+            self._cooldown = _COOLDOWN_FRAMES
             return None
         return self._inject_queue.popleft()
 
     def _observe(self, token_id: int) -> None:
-        # ── Phase-B: structured special-token protocol ────────────────────────
-        if token_id == TOOL_CALL_ID and self.state is OrchestratorState.NORMAL and self._cooldown == 0:
+        # Model opens a tool call.
+        if (
+            token_id == TOOL_CALL_ID
+            and self.state is OrchestratorState.NORMAL
+            and self._cooldown == 0
+        ):
             logger.info("[orchestrator] <|tool_call|> detected — buffering call")
             self._call_buf = []
             self.state     = OrchestratorState.IN_CALL
             return
 
+        # Inside a call: buffer until the model closes it.
         if self.state is OrchestratorState.IN_CALL:
             if token_id == TOOL_END_ID:
-                # Decode buffered tokens → "get_time" or "get_weather {\"city\":\"X\"}"
                 raw = self.tokenizer.decode(self._call_buf).strip()
-                logger.info(f"[orchestrator] call buffer decoded: {raw!r}")
+                logger.info(f"[orchestrator] call decoded: {raw!r}")
                 intent = _parse_call(raw)
                 if intent:
                     self._call_buf = []
@@ -125,41 +125,17 @@ class ToolOrchestrator:
                     self._cooldown = _COOLDOWN_FRAMES
             else:
                 self._call_buf.append(token_id)
-            return
 
-        # ── Phase-A fallback: keyword detection in rolling text buffer ─────────
-        if not self.enable_keyword_fallback:
-            return
-        if token_id in (0, 3) or token_id >= self.tokenizer.get_piece_size():
-            return
-        piece = self.tokenizer.id_to_piece(token_id).replace("▁", " ")
-        self._text_buffer += piece
-        if len(self._text_buffer) > _BUFFER_MAX:
-            self._text_buffer = self._text_buffer[-_BUFFER_MAX:]
-
-        if (
-            self.state is OrchestratorState.NORMAL
-            and self._cooldown == 0
-            and self._pending_task is None
-        ):
-            intent = detect_intent(self._text_buffer)
-            if intent:
-                logger.info(f"[orchestrator] keyword intent: {intent}")
-                self._text_buffer = ""
-                self.state        = OrchestratorState.EXEC
-                self._pending_task = asyncio.ensure_future(self._run_tool(intent, structured=False))
-
-    async def _run_tool(self, intent: ToolIntent, structured: bool = True) -> None:
+    async def _run_tool(self, intent: ToolIntent) -> None:
         try:
             result = await reg.call(intent.name, intent.args)
             logger.info(f"[orchestrator] result: {result!r}")
             result_tokens = self.tokenizer.encode(result)
-            if structured:
-                # Wrap with <|tool_result|> … <|tool_result_end|> so the model
-                # sees the same format it was fine-tuned on.
-                self._inject_queue.extend([TOOL_RESULT_ID] + result_tokens + [TOOL_RESULT_END_ID])
-            else:
-                self._inject_queue.extend(result_tokens)
+            # Wrap with <|tool_result|> … <|tool_result_end|> — the exact format
+            # the model was fine-tuned to consume.
+            self._inject_queue.extend(
+                [TOOL_RESULT_ID] + result_tokens + [TOOL_RESULT_END_ID]
+            )
             self.state = OrchestratorState.INJECT
         except Exception as exc:
             logger.error(f"[orchestrator] tool task failed: {exc}")
@@ -171,7 +147,6 @@ class ToolOrchestrator:
 
 def _parse_call(raw: str) -> Optional[ToolIntent]:
     """Parse 'get_time' or 'get_weather {"city": "Dhaka"}' into a ToolIntent."""
-    import json
     parts = raw.split(None, 1)
     if not parts:
         return None
