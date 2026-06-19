@@ -49,12 +49,14 @@ _TRIGGERS: list[tuple[re.Pattern, str, Callable]] = [
         lambda m: {"city": m.group(1).strip()},
     ),
     (
-        re.compile(r'\bweather\b', re.IGNORECASE),
+        # Only trigger on explicit weather query, not bare "weather"
+        re.compile(r"\b(what('s| is) the weather|how('s| is) the weather|weather (today|now|outside|like))\b", re.IGNORECASE),
         "get_weather",
-        lambda _: {"city": "local"},
+        lambda _: {"city": "Dhaka"},
     ),
     (
-        re.compile(r"\b(time|o'clock|what time)\b", re.IGNORECASE),
+        # Only trigger on explicit time query, not bare "time"
+        re.compile(r"\b(what (time|o'clock)|what's the time|current time|tell me the time)\b", re.IGNORECASE),
         "get_time",
         lambda _: {},
     ),

@@ -39,8 +39,8 @@ def get_tool_spec_prompt() -> str:
     names = list(_TOOLS.keys())
     return (
         "You have access to real-time tools: " + ", ".join(names) + ". "
-        "When answering questions about the current time or weather, "
-        "say the word 'time' or 'weather' naturally in your response."
+        "When someone asks about the current time or weather, "
+        "give them the accurate answer from those tools."
     )
 
 

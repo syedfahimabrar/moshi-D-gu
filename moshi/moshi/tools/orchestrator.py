@@ -89,8 +89,9 @@ class ToolOrchestrator:
         if self.state is not OrchestratorState.INJECT:
             return None
         if not self._inject_queue:
-            self.state     = OrchestratorState.NORMAL
-            self._cooldown = _COOLDOWN_FRAMES
+            self.state        = OrchestratorState.NORMAL
+            self._cooldown    = _COOLDOWN_FRAMES
+            self._text_buffer = ""  # clear so injected result doesn't re-trigger
             return None
         return self._inject_queue.popleft()
 
