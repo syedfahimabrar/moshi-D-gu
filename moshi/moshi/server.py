@@ -169,10 +169,12 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
+        # Do NOT inject the tool spec into the prompt: the fine-tuned model
+        # already knows when to emit <|tool_call|>, and priming it with
+        # "you have time/weather tools" makes it bring those topics up
+        # unprompted ("let me know if you need the time...").
         base_text_prompt = request.query.get("text_prompt", "")
-        tool_spec = tool_registry.get_tool_spec_prompt()
-        enhanced_prompt = f"{base_text_prompt} {tool_spec}".strip() if base_text_prompt else tool_spec
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(enhanced_prompt))
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(base_text_prompt))
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():

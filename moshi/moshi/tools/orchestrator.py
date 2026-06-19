@@ -47,9 +47,15 @@ class ToolOrchestrator:
         self,
         lm_gen,
         text_tokenizer: sentencepiece.SentencePieceProcessor,
+        enable_keyword_fallback: bool = False,
     ) -> None:
         self.lm_gen    = lm_gen
         self.tokenizer = text_tokenizer
+        # Phase-A keyword fallback triggers on the model's OWN speech, which
+        # causes false positives (e.g. "in many places" → city="many") and
+        # unprompted tool talk. Off by default now the model is fine-tuned to
+        # emit the <|tool_call|> special tokens directly.
+        self.enable_keyword_fallback = enable_keyword_fallback
         self._reset_session_state()
 
     def _reset_session_state(self) -> None:
@@ -122,6 +128,8 @@ class ToolOrchestrator:
             return
 
         # ── Phase-A fallback: keyword detection in rolling text buffer ─────────
+        if not self.enable_keyword_fallback:
+            return
         if token_id in (0, 3) or token_id >= self.tokenizer.get_piece_size():
             return
         piece = self.tokenizer.id_to_piece(token_id).replace("▁", " ")
