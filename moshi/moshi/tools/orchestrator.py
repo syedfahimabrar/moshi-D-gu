@@ -35,8 +35,11 @@ from . import registry as reg
 
 logger = logging.getLogger(__name__)
 
-_COOLDOWN_FRAMES = 75  # ~6 s at 12.5 Hz before another call can fire (the model
-                       # keeps "wanting" to call for a while after a request)
+import os
+# Frames (12.5 Hz) before another call can fire. The model keeps "wanting" to
+# call for a while after a request, so this guards against repeats. Tunable via
+# the TOOL_COOLDOWN env var without code changes.
+_COOLDOWN_FRAMES = int(os.environ.get("TOOL_COOLDOWN", "75"))
 
 
 class ToolOrchestrator:
