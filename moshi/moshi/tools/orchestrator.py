@@ -19,6 +19,7 @@ per frame so the audio is conditioned on the real tool output.
 """
 import asyncio
 import json
+import re
 import logging
 from collections import deque
 from typing import Optional
@@ -150,16 +151,35 @@ class ToolOrchestrator:
 
 
 def _parse_call(raw: str) -> Optional[ToolIntent]:
-    """Parse a tool call the model emitted into a ToolIntent.
+    """Parse the content the model emitted inside <|tool_call|>…<|tool_end|>.
 
-    Accepts two formats:
-      - "get_time"                      → name only, no args
-      - "get_weather London"           → plain trailing arg → {"city": "London"}
-      - 'get_weather {"city": "X"}'    → JSON args
+    The model often phrases the call naturally ("get the time", "weather in
+    London") rather than as the exact function name, so map by intent:
+      - mentions "weather" → get_weather (+ city after "in", or a capitalised name)
+      - mentions "time"/"clock" → get_time
+    Falls back to strict "name args" / JSON parsing.
     """
-    parts = raw.split(None, 1)
-    if not parts:
+    s = raw.strip()
+    if not s:
         return None
+    low = s.lower()
+
+    if "weather" in low:
+        city = None
+        m = re.search(r"\bin\s+([A-Za-z][A-Za-z .'-]*)", s)
+        if m:
+            city = m.group(1).strip()
+        else:
+            caps = re.findall(r"\b[A-Z][a-z]+\b", s)
+            if caps:
+                city = " ".join(caps)
+        return ToolIntent("get_weather", {"city": city} if city else {})
+
+    if "time" in low or "clock" in low:
+        return ToolIntent("get_time", {})
+
+    # Strict fallback: "get_weather London" or 'get_weather {"city": "X"}'
+    parts = s.split(None, 1)
     name = parts[0]
     args: dict = {}
     if len(parts) > 1:
@@ -167,7 +187,6 @@ def _parse_call(raw: str) -> Optional[ToolIntent]:
         try:
             args = json.loads(rest)
         except json.JSONDecodeError:
-            # Plain trailing argument (what the model emits naturally).
             if name == "get_weather" and rest:
                 args = {"city": rest}
     return ToolIntent(name=name, args=args)
