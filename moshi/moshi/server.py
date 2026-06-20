@@ -403,6 +403,11 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument("--text-topk", type=int, default=None,
+                        help="Override text-stream top-k. Set to 1 for greedy text "
+                             "decoding (matches the offline argmax sanity check).")
+    parser.add_argument("--text-temp", type=float, default=None,
+                        help="Override text-stream temperature.")
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -470,6 +475,12 @@ def main():
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
     )
+    if args.text_topk is not None:
+        state.lm_gen.top_k_text = args.text_topk
+        logger.info(f"text top_k overridden → {args.text_topk}")
+    if args.text_temp is not None:
+        state.lm_gen.temp_text = args.text_temp
+        logger.info(f"text temp overridden → {args.text_temp}")
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
