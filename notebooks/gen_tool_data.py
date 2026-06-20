@@ -198,11 +198,24 @@ def _make(kind, city=None):
     raise ValueError(kind)
 
 
+def _chat_turn():
+    """A non-tool conversational turn (used for negatives / continuation)."""
+    q, a = random.choice(_CHITCHAT + _DISTRACTORS)
+    return Turn(query=q, reply=a)
+
+
 def examples(seed=42):
-    """Return the full list of abstract Examples."""
+    """Return the full list of abstract Examples.
+
+    Phase-1b: heavier on negatives and mixed conversations so the model learns
+    to keep <|tool_call|> DOWN during normal speech (the calibration fix), and
+    to return to normal AFTER a call (post-call continuation).
+    """
     random.seed(seed)
     out = []
-    for _ in range(400):
+
+    # ── Positives: tool calls ───────────────────────────────────────────────
+    for _ in range(350):
         out.append(_make("time"))
     for _ in range(120):
         out.append(_make("time_multiturn"))
@@ -215,12 +228,25 @@ def examples(seed=42):
         out.append(_make("weather_local"))
     for _ in range(120):
         out.append(_make("weather_multiturn"))
-    for _ in range(180):
+
+    # ── Mixed: tool turn next to a normal turn (calibration + continuation) ──
+    for _ in range(160):                 # call, then normal chat (don't re-call)
+        tool = random.choice([_make("time"), _make("weather")]).turns[0]
+        out.append(Example("mixed", [tool, _chat_turn()]))
+    for _ in range(160):                 # normal chat, then a genuine call
+        tool = random.choice([_make("time"), _make("weather")]).turns[0]
+        out.append(Example("mixed", [_chat_turn(), tool]))
+
+    # ── Negatives: must NOT call (heavy, for suppression) ───────────────────
+    for _ in range(300):
         out.append(_make("silence"))
-    for _ in range(220):
+    for _ in range(300):
         out.append(_make("chitchat"))
-    for _ in range(260):
+    for _ in range(350):
         out.append(_make("distractor"))
+    for _ in range(150):                 # longer multi-turn chit-chat (all normal)
+        out.append(Example("chat", [_chat_turn(), _chat_turn()]))
+
     random.shuffle(out)
     return out
 
