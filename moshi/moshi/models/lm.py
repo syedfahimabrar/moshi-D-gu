@@ -878,6 +878,19 @@ class LMGen(StreamingModule[_LMGenState]):
         lm_model = self.lm_model
 
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
+        # --- tool-call debug / bias (env-gated, zero overhead when unset) ---
+        import os as _os
+        _TOOL_ID = 32000
+        _bias = float(_os.environ.get("TOOL_BIAS", "0") or 0)
+        if _bias:
+            text_logits[..., _TOOL_ID] += _bias
+        if _os.environ.get("DEBUG_TOOL"):
+            _tl = text_logits.float().reshape(-1)
+            if _tl.shape[0] > _TOOL_ID:
+                _rank = int((_tl > _tl[_TOOL_ID]).sum().item())
+                if _rank < 80:   # only when the tool token is at least in contention
+                    _top = _tl.topk(5).indices.tolist()
+                    print(f"[dbg] <|tool_call|> rank={_rank} logit={_tl[_TOOL_ID]:.2f} top5={_top}")
         sampled_text_token = sample_token(
             text_logits.float(),
             self.use_sampling,
