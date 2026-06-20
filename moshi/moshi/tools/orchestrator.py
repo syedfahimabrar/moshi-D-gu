@@ -34,7 +34,8 @@ from . import registry as reg
 
 logger = logging.getLogger(__name__)
 
-_COOLDOWN_FRAMES = 25  # ~2 s at 12.5 Hz before another call can fire
+_COOLDOWN_FRAMES = 75  # ~6 s at 12.5 Hz before another call can fire (the model
+                       # keeps "wanting" to call for a while after a request)
 
 
 class ToolOrchestrator:
@@ -115,12 +116,15 @@ class ToolOrchestrator:
                 raw = self.tokenizer.decode(self._call_buf).strip()
                 logger.info(f"[orchestrator] call decoded: {raw!r}")
                 intent = _parse_call(raw)
-                if intent:
+                # Only dispatch a recognised tool; ignore garbled calls silently
+                # (don't speak "unknown tool: ...").
+                if intent and intent.name in reg._TOOLS:
                     self._call_buf = []
                     self.state     = OrchestratorState.EXEC
                     self._pending_task = asyncio.ensure_future(self._run_tool(intent))
                 else:
-                    logger.warning(f"[orchestrator] unrecognised call: {raw!r}")
+                    logger.warning(f"[orchestrator] ignoring unrecognised call: {raw!r}")
+                    self._call_buf = []
                     self.state     = OrchestratorState.NORMAL
                     self._cooldown = _COOLDOWN_FRAMES
             else:
