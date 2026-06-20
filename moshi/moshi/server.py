@@ -228,6 +228,16 @@ class ServerState:
                     be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
+                    # VAD gate: a tool call should only fire shortly after the
+                    # user actually speaks. The model's tool-call signal is
+                    # persistently elevated, so without this it fires unprompted.
+                    rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+                    if rms > self._tool_vad_rms:
+                        self._frames_since_speech = 0
+                    else:
+                        self._frames_since_speech += 1
+                    self.lm_gen._tool_enabled = (
+                        self._frames_since_speech <= self._tool_vad_window)
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
@@ -275,6 +285,11 @@ class ServerState:
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             orchestrator = ToolOrchestrator(self.lm_gen, self.text_tokenizer)
+            # VAD-gate state (tool calls only fire near recent user speech)
+            self._frames_since_speech = 10**9
+            self._tool_vad_rms    = getattr(self, "tool_vad_rms", 0.01)
+            self._tool_vad_window = getattr(self, "tool_vad_window", 38)  # ~3 s
+            self.lm_gen._tool_enabled = True
             async def is_alive():
                 if close or ws.closed:
                     return False
@@ -414,6 +429,11 @@ def main():
                         help="Emit <|tool_call|> when it is the top non-padding text "
                              "token and its logit >= this value (e.g. 1.0). Lets the "
                              "learned tool signal win over the PAD/EPAD silence tokens.")
+    parser.add_argument("--tool-vad-window", type=int, default=38,
+                        help="Frames (12.5 Hz) after the user last spoke during which "
+                             "a tool call may fire. ~38 = 3 s. Stops unprompted calls.")
+    parser.add_argument("--tool-vad-rms", type=float, default=0.01,
+                        help="Mic RMS above this counts as the user speaking (VAD gate).")
     parser.add_argument("--tool-prompt", type=str,
                         default=("You have live access to the current time and weather. "
                                  "When the user asks the time or weather, answer with the "
@@ -500,6 +520,9 @@ def main():
     state.tool_prompt = args.tool_prompt
     if args.tool_prompt:
         logger.info(f"tool prompt → {args.tool_prompt!r}")
+    state.tool_vad_window = args.tool_vad_window
+    state.tool_vad_rms = args.tool_vad_rms
+    logger.info(f"tool VAD: window={args.tool_vad_window} frames, rms>{args.tool_vad_rms}")
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()

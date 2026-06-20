@@ -907,7 +907,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # dominate greedy/sampling. When the tool token is the top content token
         # and clears a threshold, emit it. (B==1 streaming path.)
         _thr = getattr(self, "tool_call_threshold", None)
-        if _thr is not None:
+        if _thr is not None and getattr(self, "_tool_enabled", True):
             _TOOL_ID = 32000
             _tl = text_logits.float().reshape(-1)
             if _tl.shape[0] > _TOOL_ID:
