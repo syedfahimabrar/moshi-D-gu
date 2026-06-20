@@ -169,12 +169,14 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        # Do NOT inject the tool spec into the prompt: the fine-tuned model
-        # already knows when to emit <|tool_call|>, and priming it with
-        # "you have time/weather tools" makes it bring those topics up
-        # unprompted ("let me know if you need the time...").
+        # Tool-aware system prompt: tells the model it HAS live time/weather so
+        # its language head stops emitting "I can't access live data" refusals.
+        # Emission of <|tool_call|> is gated by the threshold, so this prompt
+        # only shapes the spoken text, it won't cause spurious special tokens.
         base_text_prompt = request.query.get("text_prompt", "")
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(base_text_prompt))
+        tool_prompt = getattr(self, "tool_prompt", "") or ""
+        enhanced = f"{base_text_prompt} {tool_prompt}".strip()
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(enhanced))
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
@@ -412,6 +414,13 @@ def main():
                         help="Emit <|tool_call|> when it is the top non-padding text "
                              "token and its logit >= this value (e.g. 1.0). Lets the "
                              "learned tool signal win over the PAD/EPAD silence tokens.")
+    parser.add_argument("--tool-prompt", type=str,
+                        default=("You have live access to the current time and weather. "
+                                 "When the user asks the time or weather, answer with the "
+                                 "real value. Never say you cannot access live information."),
+                        help="System-prompt text telling the model it has live tools "
+                             "(suppresses 'I can't access live data' refusals). "
+                             "Pass an empty string to disable.")
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -488,6 +497,9 @@ def main():
     if args.tool_threshold is not None:
         state.lm_gen.tool_call_threshold = args.tool_threshold
         logger.info(f"tool-call threshold → {args.tool_threshold}")
+    state.tool_prompt = args.tool_prompt
+    if args.tool_prompt:
+        logger.info(f"tool prompt → {args.tool_prompt!r}")
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
