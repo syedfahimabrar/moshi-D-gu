@@ -408,6 +408,10 @@ def main():
                              "decoding (matches the offline argmax sanity check).")
     parser.add_argument("--text-temp", type=float, default=None,
                         help="Override text-stream temperature.")
+    parser.add_argument("--tool-threshold", type=float, default=None,
+                        help="Emit <|tool_call|> when it is the top non-padding text "
+                             "token and its logit >= this value (e.g. 1.0). Lets the "
+                             "learned tool signal win over the PAD/EPAD silence tokens.")
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -481,6 +485,9 @@ def main():
     if args.text_temp is not None:
         state.lm_gen.temp_text = args.text_temp
         logger.info(f"text temp overridden → {args.text_temp}")
+    if args.tool_threshold is not None:
+        state.lm_gen.tool_call_threshold = args.tool_threshold
+        logger.info(f"tool-call threshold → {args.tool_threshold}")
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()

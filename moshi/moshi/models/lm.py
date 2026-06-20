@@ -902,6 +902,21 @@ class LMGen(StreamingModule[_LMGenState]):
         assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
+        # Tool-call emission: the model learns to rank <|tool_call|> as the top
+        # NON-padding token at the right moment, but PAD(3)/EPAD(0) (silence)
+        # dominate greedy/sampling. When the tool token is the top content token
+        # and clears a threshold, emit it. (B==1 streaming path.)
+        _thr = getattr(self, "tool_call_threshold", None)
+        if _thr is not None:
+            _TOOL_ID = 32000
+            _tl = text_logits.float().reshape(-1)
+            if _tl.shape[0] > _TOOL_ID:
+                _content = _tl.clone()
+                _content[0] = float("-inf")   # ignore EPAD
+                _content[3] = float("-inf")   # ignore PAD
+                if int(_content.argmax()) == _TOOL_ID and float(_tl[_TOOL_ID]) >= _thr:
+                    sampled_text_token = torch.full_like(sampled_text_token, _TOOL_ID)
+
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
         if self.return_logits:
