@@ -56,9 +56,15 @@ class ToolOrchestrator:
         self,
         lm_gen,
         text_tokenizer: sentencepiece.SentencePieceProcessor,
+        silence_codes: Optional[torch.Tensor] = None,
     ) -> None:
         self.lm_gen    = lm_gen
         self.tokenizer = text_tokenizer
+        # Mimi-encoded silence for Moshi's audio rows, shape [1, 8, 1]. While we
+        # force the result tokens into the text stream we also force the audio to
+        # silence so the raw machine-formatted result is NOT vocalised — only the
+        # model's own paraphrase (generated after the result block) is spoken.
+        self.silence_codes = silence_codes
         self._reset_session_state()
 
     def _reset_session_state(self) -> None:
@@ -66,6 +72,7 @@ class ToolOrchestrator:
         self._call_buf: list[int] = []     # tokens between <|tool_call|> … <|tool_end|>
         self._inject_queue: deque[int] = deque()
         self._cooldown         = 0
+        self._mute_audio       = 0         # frames left to force silent audio
         self._pending_task: Optional[asyncio.Task] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -79,6 +86,15 @@ class ToolOrchestrator:
             self._cooldown -= 1
 
         forced = self._next_inject_token()
+
+        # Silence Moshi's audio while injecting the result (+ a short tail to
+        # cover the text→audio delay), so the raw result isn't spoken.
+        if forced is not None:
+            self._mute_audio = 2           # keep muting briefly after the last token
+        if moshi_tokens is None and self._mute_audio > 0 and self.silence_codes is not None:
+            moshi_tokens = self.silence_codes
+        if self._mute_audio > 0 and forced is None:
+            self._mute_audio -= 1
 
         tokens = self.lm_gen.step(
             input_tokens=input_tokens,

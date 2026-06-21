@@ -284,7 +284,16 @@ class ServerState:
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
-            orchestrator = ToolOrchestrator(self.lm_gen, self.text_tokenizer)
+            # Steady-state Mimi silence codes [1, 8, 1] for muting Moshi's audio
+            # while the tool result is injected (so the raw result isn't spoken).
+            if getattr(self, "_silence_codes", None) is None:
+                with torch.no_grad():
+                    _sil = self.mimi.encode(
+                        torch.zeros(1, 1, self.frame_size * 8, device=self.device))
+                self._silence_codes = _sil[:, :, -1:].contiguous()   # last frame = steady silence
+                self.mimi.reset_streaming()
+            orchestrator = ToolOrchestrator(self.lm_gen, self.text_tokenizer,
+                                            silence_codes=self._silence_codes)
             # VAD-gate state (tool calls only fire near recent user speech)
             self._frames_since_speech = 10**9
             self._tool_vad_rms    = getattr(self, "tool_vad_rms", 0.01)
